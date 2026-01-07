@@ -15,17 +15,21 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Lua
-        uses: leafo/gh-actions-lua@v10
+        uses: leafo/gh-actions-lua@v10.0.0
         with:
           luaVersion: "5.3"
 
-      - name: Setup LuaRocks
-        uses: leafo/gh-actions-luarocks@v4
+      - name: Setup Luarocks
+        uses: leafo/gh-actions-luarocks@v4.0.0
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre3 libpcre3-dev
           luarocks install luasocket
-          luarocks make
+          luarocks install lrexlib-pcre2
+          luarocks install lualogging
+          luarocks install luaposix
 
       - name: Save commit info
         id: commits
@@ -37,198 +41,155 @@ jobs:
 
       - name: Run benchmark on PR branch
         run: |
-          lua bench.lua | tee pr-bench.txt
+          lua bench.lua > pr_raw.txt
 
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          clean: false
           path: base
 
       - name: Run benchmark on base branch
-        working-directory: base
         run: |
-          # Re-install deps for base if needed, or rely on global rocks
-          # Usually global rocks work. But we need to make sure 'casbin' rock is built from source if bench uses it.
-          # bench.lua requires "src.main.Enforcer" relative to PWD usually.
-          # Let's check bench.lua: local Enforcer = require("src.main.Enforcer")
-          # It uses local paths. So we just need luasocket.
-          lua bench.lua | tee ../base-bench.txt
+          cd base
+          lua bench.lua > ../base_raw.txt
 
-      - name: Compare benchmarks
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Convert results to Go benchmark format
+        run: |
+          python3 -c '
+          import sys, re
+
+          def convert(infile, outfile):
+              with open(infile, "r") as f:
+                  lines = f.readlines()
+              
+              out = []
+              for line in lines:
+                  # Raw:    Total ops = 10000    Time per op = 0.0009 ms
+                  m = re.match(r"^(.*?):\s+Total ops = (\d+)\s+Time per op = ([0-9.]+) ms", line.strip())
+                  if m:
+                      name = m.group(1).strip().replace(" ", "")
+                      ops = int(m.group(2))
+                      ms = float(m.group(3))
+                      ns = ms * 1e6
+                      # Use "Benchmark" prefix so benchstat recognizes it
+                      out.append(f"Benchmark{name} {ops} {ns} ns/op")
+              
+              with open(outfile, "w") as f:
+                  f.write("\n".join(out) + "\n")
+
+          convert("base_raw.txt", "base-bench.txt")
+          convert("pr_raw.txt", "pr-bench.txt")
+          '
+
+      - name: Compare benchmarks with benchstat
         id: benchstat
         run: |
           cat > comparison.md << 'EOF'
           ## Benchmark Comparison
-
+          
           Comparing base branch (`${{ steps.commits.outputs.base_short }}`)
           vs PR branch (`${{ steps.commits.outputs.head_short }}`)
-
+          
           ```
           EOF
-          
-          # Python script to parse results and generate table
-          python3 - <<'PY' >> comparison.md
-          import sys
-          import re
-          import platform
-          import math
-
-          # 1. Parse functions
-          def parse_bench_file(filename):
-              data = {}
-              try:
-                  with open(filename, 'r') as f:
-                      for line in f:
-                          # Parse: Name: \tTotal ops = N \tTime per op = X.XXXX ms
-                          # Regex to capture Name and Time
-                          # Example: Raw: 	Total ops = 10000 	Time per op = 0.0012 ms
-                          m = re.search(r'^(.*?):\s+Total ops = \d+\s+Time per op = ([\d\.]+) ms', line)
-                          if m:
-                              name = m.group(1).strip()
-                              ms_val = float(m.group(2))
-                              ns_val = ms_val * 1e6 # Convert ms to ns
-                              data[name] = {"cpu_time": ns_val}
-              except FileNotFoundError:
-                  pass
-              return data
-
-          base = parse_bench_file("base-bench.txt")
-          pr = parse_bench_file("pr-bench.txt")
-
-          all_keys = sorted(list(set(base.keys()) | set(pr.keys())))
-
-          # 2. Helpers
-          def fmt_ns(val_ns):
-              if val_ns == 0: return "0"
-              if val_ns >= 1e9: return f"{val_ns/1e9:.3f}s"
-              if val_ns >= 1e6: return f"{val_ns/1e6:.3f}m"
-              if val_ns >= 1e3: return f"{val_ns/1e3:.3f}µ"
-              return f"{val_ns:.3f}n"
-
-          # Get CPU info
-          cpu_info = "Unknown CPU"
-          try:
-              if platform.system() == "Linux":
-                  with open("/proc/cpuinfo", "r") as f:
-                      for line in f:
-                          if "model name" in line:
-                              cpu_info = line.split(":", 1)[1].strip()
-                              break
-          except: pass
-
-          print(f"goos: {platform.system().lower()}")
-          print(f"goarch: {platform.machine().lower()}")
-          print(f"pkg: lua-casbin")
-          print(f"cpu: {cpu_info}")
-          
-          # Table Headers
-          # Col 1: 50 chars (Name)
-          # Col 2: 19 chars (base)
-          # Col 3: 19 chars (pr)
-          # Col 4: 27 chars (stats)
-          # Col 5: 9 chars (delta)
-          
-          # Line 1
-          print(f"{'':<50} │ {'base-bench.txt':^19} │ {'pr-bench.txt':^47} │")
-          # Line 2: Note the column widths for data rows are 50, 19, 19, 27, 9
-          # The header "pr-bench.txt" spans the last 3 cols? 
-          # In the example:
-          # │ /tmp/base-bench.txt │           /tmp/pr-bench.txt           │
-          # │       sec/op        │    sec/op      vs base                │   Delta
-          # The second line headers align with data columns.
-          # Data cols: Name(50) Val1(19) Val2(19) Stats(27) Delta(9)
-          # Total width right of Name: 19+3 + 19+3 + 27+3 + 9 = ?
-          # Actually let's look at the example separators.
-          # " │ " is 3 chars.
-          # Name(50) "   " Val1(19) "   " Val2(19) "   " Stats(27) "   " Delta(9)
-          # Wait, the example has "│" separators in header but spaces in body.
-          # Header 1:
-          # Space(50) " │ " Title1(19) " │ " Title2(47) " │"
-          # 19 + 3 + 27 = 49? No.
-          # The example snippet:
-          # │ /tmp/base-bench.txt │           /tmp/pr-bench.txt           │
-          # │       sec/op        │    sec/op      vs base                │   Delta
-          #
-          # Let's try to match the columns:
-          # Col 1: 50 spaces
-          # Col 2: base-bench (19)
-          # Col 3+4: pr-bench (matches PR val + Stats?)
-          # PR Val (19) + Gap (3) + Stats (27) = 49.
-          # So Title2 width 49? 
-          # My previous code used 47. Let's adjust.
-          # 19 + 3 + 27 = 49.
-          # So Header 1:
-          # print(f"{'':<50} │ {'base-bench.txt':^19} │ {'pr-bench.txt':^49} │")
-          
-          # Header 2:
-          # print(f"{'':<50} │ {'sec/op':^19} │ {'sec/op':^19} {'vs base':<27} │   Delta")
-          
-          print(f"{'':<50} │ {'base-bench.txt':^19} │ {'pr-bench.txt':^49} │")
-          print(f"{'':<50} │ {'sec/op':^19} │ {'sec/op':^19} {'vs base':<27} │   Delta")
-
-          base_vals = []
-          pr_vals = []
-
-          for k in all_keys:
-              b_item = base.get(k)
-              p_item = pr.get(k)
-              b_val = b_item.get("cpu_time", 0.0) if b_item else 0.0
-              p_val = p_item.get("cpu_time", 0.0) if p_item else 0.0
-              
-              if b_val > 0: base_vals.append(b_val)
-              if p_val > 0: pr_vals.append(p_val)
-              
-              if b_val > 0:
-                  diff = (p_val - b_val) / b_val
-                  diff_str = f"{diff:+.2%}"
-                  if diff < -0.10: status = "🚀"
-                  elif diff > 0.10: status = "🐌"
-                  else: status = "➡️"
-              else:
-                  diff_str = "-"
-                  status = ""
-              
-              b_str = (fmt_ns(b_val) + " ± ∞ ¹") if b_val else "-"
-              p_str = (fmt_ns(p_val) + " ± ∞ ¹") if p_val else "-"
-              
-              stats = "~ (p=1.000 n=1) ²"
-              
-              display_name = k
-              
-              # Data row alignment
-              if b_val > 0 and p_val > 0:
-                   print(f"{display_name:<50}   {b_str:>19}   {p_str:>19}   {stats:<27}   {diff_str:>9} {status}")
-              else:
-                   print(f"{display_name:<50}   {b_str:>19}   {p_str:>19}   {'':<27}   {diff_str:>9} {status}")
-
-          def get_geomean(vals):
-              if not vals: return 0.0
-              return math.exp(sum(math.log(x) for x in vals) / len(vals))
-
-          g_base = get_geomean(base_vals)
-          g_pr = get_geomean(pr_vals)
-          
-          g_diff_str = "-"
-          g_status = ""
-          if g_base > 0 and g_pr > 0:
-              diff = (g_pr - g_base) / g_base
-              g_diff_str = f"{diff:+.2%}"
-              if diff < -0.10: g_status = "🚀"
-              elif diff > 0.10: g_status = "🐌"
-              else: g_status = "➡️"
-          
-          g_b_str = fmt_ns(g_base) if g_base > 0 else "-"
-          g_p_str = fmt_ns(g_pr) if g_pr > 0 else "-"
-          
-          # Geomean row alignment
-          print(f"{'geomean':<50}   {g_b_str:>19}   {g_p_str:>19}   {'':<27}   {g_diff_str:>9} {g_status}")
-          
-          print("¹ need >= 6 samples for confidence interval at level 0.95")
-          print("² need >= 4 samples to detect a difference at alpha level 0.05")
-          PY
-          
+          benchstat base-bench.txt pr-bench.txt >> comparison.md || true
           echo '```' >> comparison.md
+
+          # Post-process to append percentage + emoji column (🚀 faster < -10%, 🐌 slower > +10%, otherwise ➡️)
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          p = pathlib.Path("comparison.md")
+          lines = p.read_text(encoding="utf-8").splitlines()
+          
+          def strip_worker_suffix(text: str) -> str:
+              return re.sub(r'^(\S+?)-\d+(\s|$)', r'\1\2', text, count=1)
+
+          def get_values(line):
+               matches = re.findall(r'(\d+(?:\.\d+)?)([nµmsu])', line)
+               if len(matches) >= 2:
+                   def parse_val(num_str, unit_str):
+                       v = float(num_str)
+                       if unit_str == 'n': return v * 1e-9
+                       if unit_str in ['µ', 'u']: return v * 1e-6
+                       if unit_str == 'm': return v * 1e-3
+                       return v # s
+                   v1 = parse_val(matches[0][0], matches[0][1])
+                   v2 = parse_val(matches[1][0], matches[1][1])
+                   return v1, v2
+               return None, None
+
+          # Process lines
+          processed_lines = []
+          max_len = 0
+          in_code = False
+          
+          for line in lines:
+              if line.strip() == "```":
+                  in_code = not in_code
+                  processed_lines.append(line)
+                  continue
+              
+              if not in_code:
+                  processed_lines.append(line)
+                  continue
+              
+              # Inside code block (benchstat table)
+              line = strip_worker_suffix(line)
+              
+              # Check for values to determine if it's a data row
+              v1, v2 = get_values(line)
+              
+              # Update max_len based on line length
+              # If it's a data row or header, we care about its length
+              if v1 is not None or "time/op" in line or "sec/op" in line:
+                   max_len = max(max_len, len(line))
+              
+              processed_lines.append({'text': line, 'v1': v1, 'v2': v2})
+
+          # Second pass to format
+          final_out = []
+          for item in processed_lines:
+              if isinstance(item, str):
+                  final_out.append(item)
+                  continue
+              
+              line = item['text']
+              v1 = item['v1']
+              v2 = item['v2']
+              
+              if "time/op" in line or "sec/op" in line:
+                  pad = max_len - len(line)
+                  if pad < 0: pad = 0
+                  final_out.append(f"{line}{' ' * pad}   Delta")
+                  continue
+
+              if v1 is not None and v1 != 0:
+                  diff = (v2 - v1) / v1 * 100
+                  if diff > 10: icon = "🐌"
+                  elif diff < -10: icon = "🚀"
+                  else: icon = "➡️"
+                  
+                  diff_str = f"{diff:+.2f}% {icon}"
+                  pad = max_len - len(line)
+                  if pad < 0: pad = 0
+                  final_out.append(f"{line}{' ' * pad}   {diff_str}")
+              else:
+                  final_out.append(line)
+
+          p.write_text("\n".join(final_out) + "\n", encoding="utf-8")
+          PY
+        continue-on-error: true
 
       - name: Save PR number
         run: echo ${{ github.event.number }} > pr_number.txt
